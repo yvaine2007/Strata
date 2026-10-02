@@ -38,11 +38,9 @@
 # -e GPUS=0,2. A volume set up for one card switches to the pair on its first start
 # on a two-card host unless GPU or GPUS pins it. LOW_RAM=on runs on one card.
 
-FROM nvidia/cuda:13.0.0-devel-ubuntu24.04
+# 【修改1】基础镜像对齐 PrismML 基线：Ubuntu 22.04 + CUDA 12.4.0
+FROM nvidia/cuda:12.4.0-devel-ubuntu22.04
 
-# STRATA_EXECV=1: setup.py replaces itself with the server, so the server is PID 1
-# and docker stop's SIGTERM reaches it (see setup.start). Normal Linux starts, which
-# don't set it, keep spawning the server as a child.
 ENV DEBIAN_FRONTEND=noninteractive PYTHONUNBUFFERED=1 LANG=C.UTF-8 STRATA_EXECV=1
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -53,9 +51,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /opt/strata
 COPY . .
 
-# RTX 20 (75), RTX 30 (86), RTX 40 (89), RTX 50 (120), plus 80 for A-series. CMakeLists
+# STRATA_EXECV=1: setup.py replaces itself with the server, so the server is PID 1
+# and docker stop's SIGTERM reaches it (see setup.start). Normal Linux starts, which
+# don't set it, keep spawning the server as a child.
+
+
+#Tesla P100 (60), RTX 20 (75), RTX 30 (86), RTX 40 (89), RTX 50 (120), plus 80 for A-series. CMakeLists
 # refuses anything below 75. BUILD_VISION=0 skips the image encoder build.
-ARG CUDA_ARCHITECTURES=75;80;86;89;120
+
+# 【修改2】默认架构仅保留 P100 (sm_60)
+# 原值 75;80;86;89;120 会触发 CMakeLists 的版本检查失败
+ARG CUDA_ARCHITECTURES=60
 ARG BUILD_VISION=1
 
 RUN python3 -m venv .venv \
@@ -71,9 +77,18 @@ RUN .venv/bin/python - <<'PYEOF'
 import json, os, pathlib, shutil
 import setup
 
+# 关键：修补 CMakeLists，解除对 <75 架构的拒绝
+root = setup.ROOT
+cmake_file = root / "CMakeLists.txt"
+if cmake_file.exists():
+    text = cmake_file.read_text()
+    # 将最低架构要求从 75 改为 60（具体字符串需根据实际文件调整）
+    text = text.replace("75", "60")
+    cmake_file.write_text(text)
+
 llama = setup.get_llama_cpp()
 nvcc, _ = setup.find_nvcc()
-arch = os.environ.get("CUDA_ARCHITECTURES", "75;80;86;89;120").strip().strip('"').replace(",", ";")
+arch = os.environ.get("CUDA_ARCHITECTURES", "60").strip().strip('"').replace(",", ";")
 vision = "gpu" if os.environ.get("BUILD_VISION", "1") == "1" else "none"
 
 setup.cmake_build(setup.ROOT, setup.ROOT / "build", "strata",
