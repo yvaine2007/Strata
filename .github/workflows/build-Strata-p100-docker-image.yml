@@ -38,5 +38,7 @@ jobs:
           build-args: |
             CUDA_ARCHITECTURES=60
           # 启用 GitHub Actions 缓存，加速后续构建
+          provenance: false
+          sbom: false
           cache-from: type=gha
           cache-to: type=gha,mode=max
