@@ -1,7 +1,10 @@
 # syntax=docker/dockerfile:1
 #
-# Strata: Qwen3.8-Flash-Next on NVIDIA GPUs (RTX 30/40/50, 12+ GB VRAM; two or
-# three cards can share one model, 8 GB each - docs/MULTI_GPU.md).
+# Strata: Qwen3.8-Flash-Next on NVIDIA GPUs - Tesla P100 (sm_60) community build.
+#
+# This fork targets the NVIDIA Tesla P100 (compute capability 6.0, Pascal) with a
+# CUDA 12.4 / Ubuntu 22.04 base, matching the PrismML project's validated stack.
+# CUDA 13 dropped offline compilation for sm_60, so 12.4 is the last usable toolkit.
 #
 # The engine is compiled during docker build, so the first container start only
 # downloads the model (~70 GB) and starts the server. docker build has no GPU,
@@ -11,16 +14,15 @@
 # build; a card outside the set needs a rebuild with its own arch.
 #
 # Build:
-#   docker build -t strata .
-#   docker build -t strata --build-arg CUDA_ARCHITECTURES=89 .        # RTX 40 only
+#   docker build -t strata-p100 .
 #
-# Run (host needs an NVIDIA driver >= 580 and nvidia-container-toolkit):
+# Run (host needs an NVIDIA driver >= 535 and nvidia-container-toolkit):
 #   docker run --rm --gpus all \
 #     -p 8080:8080 \
 #     --ulimit memlock=-1 \
 #     -v strata-data:/data \
 #     -e MODEL=IQ2_XS \
-#     strata
+#     strata-p100
 #
 # Setup choices are env vars, read by docker-entrypoint.sh: FAMILY, MODEL, CONTEXT,
 # VISION (no | yes | cpu), KV (int8 | q4_0 | k8v4), GPU (one card) or GPUS ("0,2"
@@ -32,15 +34,13 @@
 # /proc/meminfo, which here is the host's total, not the container's limit. Add an
 # API key before exposing the port to a network: -e API_KEY=<secret>. Pass
 # -e REINSTALL=1 to change the model settings later.
-#
-# --gpus all on a host with two usable cards: setup takes both (the layer split is
-# its recommended default). Pin one card with -e GPU=0, or name them with
-# -e GPUS=0,2. A volume set up for one card switches to the pair on its first start
-# on a two-card host unless GPU or GPUS pins it. LOW_RAM=on runs on one card.
 
-# 【修改1】基础镜像对齐 PrismML 基线：Ubuntu 22.04 + CUDA 12.4.0
+# 【修改1】基础镜像对齐 PrismML 已验证的 CUDA 12.4 + Ubuntu 22.04 基线
 FROM nvidia/cuda:12.4.0-devel-ubuntu22.04
 
+# STRATA_EXECV=1: setup.py replaces itself with the server, so the server is PID 1
+# and docker stop's SIGTERM reaches it (see setup.start). Normal Linux starts, which
+# don't set it, keep spawning the server as a child.
 ENV DEBIAN_FRONTEND=noninteractive PYTHONUNBUFFERED=1 LANG=C.UTF-8 STRATA_EXECV=1
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -51,16 +51,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /opt/strata
 COPY . .
 
-# STRATA_EXECV=1: setup.py replaces itself with the server, so the server is PID 1
-# and docker stop's SIGTERM reaches it (see setup.start). Normal Linux starts, which
-# don't set it, keep spawning the server as a child.
-
-
-#Tesla P100 (60), RTX 20 (75), RTX 30 (86), RTX 40 (89), RTX 50 (120), plus 80 for A-series. CMakeLists
-# refuses anything below 75. BUILD_VISION=0 skips the image encoder build.
-
-# 【修改2】默认架构仅保留 P100 (sm_60)
-# 原值 75;80;86;89;120 会触发 CMakeLists 的版本检查失败
+# 【修改2】默认架构仅保留 P100 (sm_60)。
+# CUDA 12.4 是最后一个支持 Pascal 离线编译的工具链。
+# 注意：CMAKE_CUDA_ARCHITECTURES 的默认值改为 60，配合下面传入的
+# -DSTRATA_EXPERIMENTAL_SM60=ON，CMakeLists 会放行 sm_60 的编译。
 ARG CUDA_ARCHITECTURES=60
 ARG BUILD_VISION=1
 
@@ -73,18 +67,17 @@ RUN python3 -m venv .venv \
 # exactly the way setup.py builds them. BUILD.json is what setup.py reads to
 # decide whether an engine is current: source=local with a matching src hash
 # means the first start reuses it instead of recompiling.
+#
+# 【修改3】编译阶段加入 -DSTRATA_EXPERIMENTAL_SM60=ON。
+# 这是 Strata 官方为 Pascal (sm_60) / Volta (sm_70) 准备的社区构建开关：
+#   * 跳过 CMakeLists 中"拒绝低于 75"的 FATAL_ERROR 检查；
+#   * 让 device.cu 的运行时设备检查接受 sm_60；
+#   * 启用 include/strata/kernels/dp4a.hpp 中针对 sm_60 的
+#     __dp4a (6.1+) 与 __nanosleep (7.0+) 回退实现。
+# 官方注释明确说明：community-tested, not in the ready-made engine。
 RUN .venv/bin/python - <<'PYEOF'
 import json, os, pathlib, shutil
 import setup
-
-# 关键：修补 CMakeLists，解除对 <75 架构的拒绝
-root = setup.ROOT
-cmake_file = root / "CMakeLists.txt"
-if cmake_file.exists():
-    text = cmake_file.read_text()
-    # 将最低架构要求从 75 改为 60（具体字符串需根据实际文件调整）
-    text = text.replace("75", "60")
-    cmake_file.write_text(text)
 
 llama = setup.get_llama_cpp()
 nvcc, _ = setup.find_nvcc()
@@ -93,11 +86,13 @@ vision = "gpu" if os.environ.get("BUILD_VISION", "1") == "1" else "none"
 
 setup.cmake_build(setup.ROOT, setup.ROOT / "build", "strata",
     ["-DSTRATA_ENABLE_CUDA=ON", "-DSTRATA_BUILD_TESTS=OFF",
+     "-DSTRATA_EXPERIMENTAL_SM60=ON",
      f"-DCMAKE_CUDA_ARCHITECTURES={arch}", f"-DCMAKE_CUDA_COMPILER={nvcc}",
      f"-DSTRATA_GGML_DIR={llama}"], None, "build-strata.bat")
 if vision != "none":
     setup.cmake_build(setup.ROOT / "tools" / "vision", setup.ROOT / "build-vision", "strata-vision",
         [f"-DLLAMA_DIR={llama}", "-DSTRATA_VISION_CUDA=ON",
+         "-DSTRATA_EXPERIMENTAL_SM60=ON",
          f"-DCMAKE_CUDA_ARCHITECTURES={arch}", f"-DCMAKE_CUDA_COMPILER={nvcc}"], None, "build-vision.bat")
 
 eng = setup.ROOT / "engine"
